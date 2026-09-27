@@ -204,6 +204,17 @@ def evaluate_tool_call(
         events = [event]
     perf.lap("session_analysis")
 
+    # Keep the org policy fresh for every caller, not just hook-dispatch: an SDK
+    # adapter or eval-server authenticated by PRISMOR_AGENT_KEY never runs
+    # `prismor enroll`, so without this it never pulls the policy that carries
+    # its telemetry sink, org mode and console tool denies. Debounced (~30s)
+    # and a no-op when not enrolled, so hook-dispatch calling it too is free.
+    try:
+        from prismor.runtime.enterprise import remote_policy as _remote
+        _remote.check_and_refresh()
+    except Exception:
+        pass
+
     engine = PolicyEngine(workspace=workspace)
     if taint_store is not None:
         engine.taint_override = taint_store
@@ -552,20 +563,6 @@ def evaluate_tool_call(
         except Exception as exc:
             sys.stderr.write(f"[prismor] finding persistence error: {exc}\n")
 
-    _dispatch_telemetry(
-        engine=engine,
-        findings=findings,
-        event=event,
-        workspace=workspace,
-        agent=agent,
-        agent_name=_agent_name if _agent_name != agent else None,
-        mode=mode,
-        session_id=session_id,
-        subject=subject,
-        eval_ms=_eval_ms,
-        session_seq=_session_seq,
-    )
-
     # Per-call inspected-volume heartbeat (org observability), managed repos only.
     if getattr(engine, "workspace_managed", False):
         try:
@@ -629,6 +626,23 @@ def evaluate_tool_call(
                 event,
             )
 
+    _dispatch_telemetry(
+        engine=engine,
+        findings=findings,
+        event=event,
+        workspace=workspace,
+        agent=agent,
+        agent_name=_agent_name if _agent_name != agent else None,
+        # The effective mode, not the caller's: an enrolled device (or an
+        # always-enforced category) blocks even under a local observe, and
+        # the console reads mode=observe as "would block".
+        mode="enforce" if blocking is not None else mode,
+        session_id=session_id,
+        subject=subject,
+        eval_ms=_eval_ms,
+        session_seq=_session_seq,
+    )
+
     # Tamper-evident signed audit trail: one chained + signed record per
     # evaluated call — every verdict, not just findings — so the local trail
     # is complete (see enterprise/audit_trail.py). Best-effort by default (a
@@ -688,8 +702,8 @@ def log_observe_findings(decision: Decision, *, mode: str, tool_name: str = "") 
     enforce. Call this right after ``evaluate_tool_call`` in every adapter so
     "observe" doesn't mean "silent."
     """
-    if mode != "observe":
-        return
+    if mode != "observe" or not decision.allow:
+        return  # the call was actually blocked; the adapter reports that itself
     would_block = [f for f in decision.findings if str(f.get("mode", "observe")).lower() == "enforce"]
     if not would_block:
         return
