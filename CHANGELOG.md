@@ -1,5 +1,10 @@
 ## [Unreleased]
 
+## [1.57.0] — 2026-10-01
+
+### Security
+- **Any web page could read the local dashboard's data and rewrite the Prismor policy** (GHSA-9xjv-g2ch-rfhc, GHSA-687v-q5f9-cpq6). The `prismor dashboard` API had no authentication and answered every origin with `Access-Control-Allow-Origin: *`. While the dashboard was running, a page open in the browser could clear `~/.prismor/policy.yaml`, change egress or per-agent controls, or read recorded sessions and tool calls. Every request now passes one check: no CORS headers, a `Host` header that must be localhost when bound to loopback (blocks DNS rebinding), and requests from another site refused with 403. Bound off loopback (`--host 0.0.0.0`), the dashboard also requires a token. It prints a `/?token=…` URL at startup; set `PRISMOR_DASHBOARD_TOKEN` to pin it. Reported by @hackchang and @Haind03.
+
 ### Added
 - **`prismor audit judge`: the LLM judge reviews a sample of ALLOWED tool calls after the fact.** The judge is too slow for every hook call, so calls the regex rules let through were never seen by a model. This command takes a deterministic sample (hash of the event id against `--sample`, default 5%) of allowed pre-call events from the local store in the window (`--since`, default 24h), skips Prismor self-test sessions and calls already audited, scrubs secrets, and sends each one to the configured judge (at most `--max`, default 50, per run). Verdicts are stored in a new `judge_audit` table. Each flagged call is printed and sent as one content-free `judge_audit` record (`verdict: observed`) through the normal sinks, chained and signed. Nothing is blocked retroactively, and hook latency is unchanged. Exits 2 when no judge is configured. Defaults: `semantic_guard.audit`.
 
