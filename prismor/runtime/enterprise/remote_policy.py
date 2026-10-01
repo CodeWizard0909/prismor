@@ -28,6 +28,7 @@ from __future__ import annotations
 from prismor.runtime.http_ua import user_agent as _http_user_agent
 
 import base64
+import copy
 import json
 import os
 import subprocess
@@ -37,6 +38,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from prismor.runtime.enterprise import identity as _identity
+
+# One verified+parsed policy, keyed on the exact bytes that were verified (plus
+# the trust root), so a hook call that loads the policy ~9 times runs openssl
+# and the YAML parse once (#478). Content-keyed, so a rewritten file can never
+# be served from a stale entry and no invalidation is needed.
+_VERIFIED: Dict[tuple, Dict[str, Any]] = {}
+
+
+def clear_policy_cache() -> None:
+    _VERIFIED.clear()
 
 
 def _public_key_path() -> Path:
@@ -637,17 +648,23 @@ def verify_and_load() -> Optional[Dict[str, Any]]:
     except OSError:
         return None
 
-    if not _verify_signature(payload, sig_b64):
-        sys.stderr.write("[prismor] remote policy signature INVALID — ignoring\n")
-        return None
-
-    try:
-        import yaml
-        parsed = yaml.safe_load(payload.decode("utf-8"))
-    except Exception:
-        return None
-    if not isinstance(parsed, dict):
-        return None
+    key = (str(_public_key_path()), payload, sig_b64)
+    parsed = _VERIFIED.get(key)
+    if parsed is None:
+        if not _verify_signature(payload, sig_b64):
+            sys.stderr.write("[prismor] remote policy signature INVALID — ignoring\n")
+            return None
+        try:
+            import yaml
+            parsed = yaml.safe_load(payload.decode("utf-8"))
+        except Exception:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        _VERIFIED.clear()
+        _VERIFIED[key] = parsed
+    # Callers mutate the result (pop "_remote_meta", etc.); never hand out the memo.
+    parsed = copy.deepcopy(parsed)
 
     meta = {}
     try:
