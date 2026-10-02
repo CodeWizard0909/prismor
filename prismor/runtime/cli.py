@@ -386,12 +386,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             port=args.port,
             workspace=_Path(args.workspace) if getattr(args, "workspace", None) else None,
             api_key=getattr(args, "api_key", None),
-            identity={
-                "mode": args.identity_mode, "issuer": args.identity_issuer,
-                "audience": args.identity_audience, "jwks_uri": args.identity_jwks,
-                "user_claim": args.identity_user_claim, "team_claim": args.identity_team_claim,
-                "roles_claim": args.identity_roles_claim,
-            } if args.identity_issuer else None,
+            identity=_identity_from_args(args),
         )
         return
 
@@ -1538,6 +1533,12 @@ def main(argv: Optional[List[str]] = None) -> None:
     # ── mcp-gateway (single MCP connector for all downstream servers) ──
     if args.command == "mcp-gateway":
         register_workspace(workspace)
+        _cfg = _identity_from_args(args)
+        if _cfg:
+            from prismor.runtime.identity_token import set_server_config
+            set_server_config(_cfg)
+            sys.stderr.write(f"[prismor-gateway] identity: {_cfg['mode']} — tokens from {_cfg['issuer']} "
+                             f"via PRISMOR_IDENTITY_TOKEN_FILE / PRISMOR_IDENTITY_TOKEN\n")
         from prismor.runtime.mcp_gateway import run_gateway, GatewayConfigError
         try:
             sys.exit(run_gateway(args, workspace))
@@ -2990,7 +2991,10 @@ def main(argv: Optional[List[str]] = None) -> None:
             _policy_edit(workspace)
             return
         if args.policy_command == "test":
-            _policy_test(workspace, test_file=getattr(args, "file", None))
+            _policy_test(workspace, test_file=getattr(args, "file", None),
+                         policy_file=getattr(args, "policy", None),
+                         name_filter=getattr(args, "filter", None),
+                         as_json=getattr(args, "json", False))
             return
         # No action given → print usage instead of the cryptic
         # "Unsupported command: policy" (the command IS supported; it needs an action).
@@ -3370,13 +3374,8 @@ def build_parser() -> argparse.ArgumentParser:
     _ep.add_argument("--api-key", default=None, help="Require Authorization: Bearer <key> on /v1/evaluate (default: $PRISMOR_EVAL_KEY); needed when exposing beyond localhost")
     # Verified end-user identity for hosts without a signed org policy (the
     # org's settings.identity wins when present). docs/identity-verification.md
-    _ep.add_argument("--identity-issuer", default=None, help="Verify X-Prismor-Identity JWTs from this issuer (turns identity on)")
-    _ep.add_argument("--identity-audience", action="append", default=None, help="Accepted audience; repeatable")
-    _ep.add_argument("--identity-jwks", default=None, help="JWKS URL of the issuer's signing keys (default: discovered from the issuer)")
-    _ep.add_argument("--identity-mode", default="observe", choices=["observe", "require"], help="observe: verify when sent; require: block calls without a valid token (default: observe)")
-    _ep.add_argument("--identity-user-claim", default="sub", help="Claim holding the user id (default: sub; often preferred_username or email). Nested: a.b")
-    _ep.add_argument("--identity-team-claim", default=None, help="Claim holding the team id")
-    _ep.add_argument("--identity-roles-claim", default=None, help="Claim holding roles/groups")
+    from prismor.runtime.identity_token import add_cli_args as _add_identity_args
+    _add_identity_args(_ep)
 
     # ── proxy: the LLM lane (governs agents that cannot be hooked) ───────
     _pp = subparsers.add_parser(
@@ -3827,6 +3826,7 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Stable session id (default: fresh per process). Hosted deployments "
                            "set this so restored session state survives gateway restarts. "
                            "Env fallback: PRISMOR_SESSION_ID")
+    _add_identity_args(gw_parser)
     gw_parser.add_argument("--namespace", choices=["plain", "none"], default="plain",
                            help="plain=<server>__<tool> (default); none=raw tool names "
                            "(single-upstream shim only)")
@@ -3943,7 +3943,10 @@ def build_parser() -> argparse.ArgumentParser:
     policy_export.add_argument("--workspace", help="Workspace path")
 
     policy_test = policy_sub.add_parser("test", help="Run declarative policy tests from policy-tests.yaml")
-    policy_test.add_argument("--file", help="Path to policy-tests.yaml (default: .prismor/policy-tests.yaml)")
+    policy_test.add_argument("--file", help="Path to policy-tests.yaml (default: .prismor/policy-tests.yaml, or the --policy file's own tests:)")
+    policy_test.add_argument("--policy", help="Test this policy file instead of the workspace's effective policy (e.g. a policy exported from the console, in CI)")
+    policy_test.add_argument("--filter", help="Only run tests whose name matches this pattern (* and ? wildcards; matrix rows are named 'test [principal]')")
+    policy_test.add_argument("--json", action="store_true", help="Print results as JSON")
     policy_test.add_argument("--workspace", help="Workspace path")
 
     # ── mode (governance mode templates → policy.yaml) ─────────────────
@@ -5645,12 +5648,27 @@ def _policy_validate(path: Path) -> None:
     raise SystemExit(1)
 
 
-def _policy_test(workspace: Path, test_file: Optional[str] = None) -> None:
-    """Run declarative policy tests from policy-tests.yaml."""
-    from prismor.runtime.policy_test import run_cases, load_cases
+def _identity_from_args(args) -> Optional[Dict[str, Any]]:
+    """--identity-* flags -> config (JWKS discovered), exiting with a clear
+    message when the issuer cannot be used."""
+    from prismor.runtime.identity_token import IdentityError, config_from_args
+    try:
+        return config_from_args(args)
+    except IdentityError as exc:
+        sys.stderr.write(f"[prismor] identity: {exc.reason} (pass --identity-jwks, or check --identity-issuer)\n")
+        raise SystemExit(2)
 
+
+def _policy_test(workspace: Path, test_file: Optional[str] = None, policy_file: Optional[str] = None,
+                 name_filter: Optional[str] = None, as_json: bool = False) -> None:
+    """Run declarative policy tests from policy-tests.yaml."""
+    from prismor.runtime.policy_test import run_cases, load_suite
+
+    policy_path = Path(policy_file) if policy_file else None
     if test_file:
         path = Path(test_file)
+    elif policy_path is not None:
+        path = policy_path  # a policy carrying its own tests: (console export)
     else:
         path = workspace / ".prismor" / "policy-tests.yaml"
 
@@ -5668,12 +5686,18 @@ def _policy_test(workspace: Path, test_file: Optional[str] = None) -> None:
             raise SystemExit(1)
 
     try:
-        cases = load_cases(path)
+        cases, fixtures = load_suite(path)
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         sys.stderr.write(f"error: {exc}\n")
         raise SystemExit(1)
 
-    result = run_cases(cases, workspace=workspace)
+    result = run_cases(cases, workspace=workspace, fixtures=fixtures,
+                       policy_path=policy_path, name_filter=name_filter)
+    if as_json:
+        print(json.dumps(result, indent=2, default=str))
+        if result["failed"]:
+            raise SystemExit(1)
+        return
     print()
     print(f"  {_color('PRISMOR', _BOLD)}  policy tests ({path.name})")
     print(f"  {_color('─' * 50, _DIM)}")
@@ -5682,6 +5706,8 @@ def _policy_test(workspace: Path, test_file: Optional[str] = None) -> None:
     for r in result["results"]:
         if r["status"] == "ok":
             print(f"  {_color('PASS', _GREEN)}  {r['name']}")
+        elif r["status"] == "skip":
+            print(f"  {_color('SKIP', _DIM)}  {r['name']}" + (f"  ({r['reason']})" if r.get("reason") else ""))
         else:
             print(f"  {_color('FAIL', _RED)}  {r['name']}")
             print(f"         input:    {r['input']!r}")
@@ -5692,7 +5718,8 @@ def _policy_test(workspace: Path, test_file: Optional[str] = None) -> None:
     print()
     color = _GREEN if result["failed"] == 0 else _RED
     print(f"  {_color(str(result['passed']) + '/' + str(result['total']) + ' passed', color)}"
-          + (f"  ({result['failed']} failed)" if result["failed"] else ""))
+          + (f"  ({result['failed']} failed)" if result["failed"] else "")
+          + (f"  ({result['skipped']} skipped)" if result.get("skipped") else ""))
     print()
     if result["failed"]:
         raise SystemExit(1)
