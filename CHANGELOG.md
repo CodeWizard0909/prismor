@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [1.59.0] — 2026-10-02
+
 ### Added
 - **Named conditions (`settings.conditions`).** You can define a condition once, such as `is_finance: "'finance' in principal.roles"`, and use it by name in any `when:`. This works like reusable derived roles. Names merge per name across policy layers.
 - **Verified identity on the MCP gateway.** `prismor mcp-gateway` takes the same `--identity-*` flags as `eval-server`, and reads the user's token from `PRISMOR_IDENTITY_TOKEN_FILE` (re-read on every call, so a refresher can rotate it) or from `PRISMOR_IDENTITY_TOKEN`. The tool list follows the verified roles. When the token changes to another user, the gateway sends `tools/list_changed` so the host re-lists.
